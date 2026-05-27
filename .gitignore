@@ -11,3 +11,11 @@ wheels/
 
 # Data 
 data/
+models/
+notebooks/models/
+
+# macOS
+.DS_Store
+
+# Model checkpoints
+*.pt
