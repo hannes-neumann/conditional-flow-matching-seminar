@@ -19,3 +19,4 @@ notebooks/models/
 
 # Model checkpoints
 *.pt
+wandb/
