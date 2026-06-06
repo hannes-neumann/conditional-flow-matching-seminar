@@ -17,9 +17,12 @@ Dependencies (beyond the training notebook):
 """
 
 import argparse
+import json
+import os
 import torch
 import torch.nn as nn
 import torchdiffeq
+import wandb
 from torchvision import datasets, transforms
 from torchmetrics.image.fid import FrechetInceptionDistance
 from tqdm import tqdm
@@ -44,6 +47,7 @@ def generate_samples(
     n_per_class: int = 500,
     solver: str = "euler",
     batch_size: int = 256,
+    euler_steps: int = 10, 
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (images, labels) where images are in [-1, 1]."""
     model.eval()
@@ -58,7 +62,7 @@ def generate_samples(
             traj = torchdiffeq.odeint(
                 lambda t, x: model(t, x, y),
                 x0,
-                torch.linspace(0, 1, 2, device=device),
+                torch.linspace(0, 1, euler_steps, device=device),
                 method=solver,
                 options={"dtype": torch.float32},
             )
@@ -85,7 +89,7 @@ def compute_fid(
     real_ds = datasets.MNIST(data_root, train=False, download=True, transform=transform)
     real_loader = torch.utils.data.DataLoader(real_ds, batch_size=256, shuffle=True)
 
-    fid = FrechetInceptionDistance(feature=64, normalize=True)  # always CPU
+    fid = FrechetInceptionDistance(feature=2048, normalize=True)  # Mayber switch back to 192
 
     # Real images (FID expects 3-channel float in [0, 1])
     seen = 0
@@ -96,7 +100,6 @@ def compute_fid(
         if seen >= n_real:
             break
 
-    # Generated images — already on CPU from generate_samples
     gen = ((generated + 1) / 2).repeat(1, 3, 1, 1)
     for start in range(0, len(gen), 256):
         fid.update(gen[start : start + 256], real=False)
@@ -152,7 +155,7 @@ def compute_accuracy(
     generated: torch.Tensor,
     labels: torch.Tensor,
     device: torch.device,
-) -> dict[str, float]:
+) -> dict[str, float | dict[int, float]]:
     clf.eval()
     preds_all, labels_all = [], []
 
@@ -179,10 +182,11 @@ def compute_accuracy(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to saved model file")
+    parser.add_argument("--model", required=True, help="Path to saved model.pt file")
     parser.add_argument("--data", default="../data", help="MNIST data root")
     parser.add_argument("--n_per_class", type=int, default=500)
     parser.add_argument("--solver", default="euler", choices=["euler", "dopri5"])
+    parser.add_argument("--no_wandb", action="store_true")
     args = parser.parse_args()
 
     device = torch.device(
@@ -191,6 +195,21 @@ def main():
         else "cpu"
     )
     print(f"Device: {device}")
+
+    # Resume wandb run from training if run_info.json exists in the model's directory
+    run_dir = os.path.dirname(args.model)
+    run_info_path = os.path.join(run_dir, "run_info.json")
+    use_wandb = not args.no_wandb and os.path.exists(run_info_path)
+
+    if use_wandb:
+        with open(run_info_path) as f:
+            run_info = json.load(f)
+        wandb.init(
+            project=run_info["wandb_project"],
+            id=run_info.get("wandb_run_id"),
+            resume="allow",
+        )
+        print(f"Logging to W&B run: {run_info.get('run_name')}")
 
     model = torch.load(args.model, weights_only=False, map_location=device)
     model.eval()
@@ -216,6 +235,14 @@ def main():
     print("Per-class accuracy:")
     for cls, a in acc["per_class"].items():
         print(f"  class {cls}: {a:.3f}")
+
+    if use_wandb:
+        wandb.log({
+            "eval/fid": fid_score,
+            "eval/accuracy": acc["overall"],
+            **{f"eval/accuracy_class_{c}": a for c, a in acc["per_class"].items()},
+        })
+        wandb.finish()
 
 
 if __name__ == "__main__":

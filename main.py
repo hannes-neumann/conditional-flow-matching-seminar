@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -111,6 +112,12 @@ def train(cfg: Config):
     run_dir = os.path.join(cfg.save_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
     print(f"Run dir: {run_dir}")
+
+    run_info: dict = {"run_name": run_name, "wandb_project": cfg.wandb_project}
+    if wandb.run is not None:
+        run_info["wandb_run_id"] = wandb.run.id
+    with open(os.path.join(run_dir, "run_info.json"), "w") as f:
+        json.dump(run_info, f, indent=2)
 
     transform = transforms.Compose([
         transforms.ToTensor(),
