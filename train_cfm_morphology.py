@@ -200,6 +200,15 @@ def load_data(cfg: Config):
             y[:, j] = torch.where(torch.isnan(col), median, col)
     assert not torch.isnan(y).any() and not torch.isnan(c).any(), "NaN values remain after imputation"
 
+    # Raw CellProfiler features span many orders of magnitude and include negative values
+    # (Hu moments, central moments). Signed log1p compresses the dynamic range while
+    # preserving sign, making z-score standardization well-behaved.
+    y = torch.sign(y) * torch.log1p(torch.abs(y))
+    print(
+        f"After signed log1p: min={y.min().item():.3f}, max={y.max().item():.3f}, "
+        f"any NaN={torch.isnan(y).any().item()}, any inf={torch.isinf(y).any().item()}"
+    )
+
     torch.manual_seed(cfg.seed)
     n = len(c)
     n_val = int(n * 0.1)
@@ -214,6 +223,12 @@ def load_data(cfg: Config):
 
     y_train = (y_train - y_mean) / y_std
     y_val = (y_val - y_mean) / y_std
+
+    abs_max = y_train.abs().max(dim=0).values
+    top = torch.topk(abs_max, k=5)
+    print("Top-5 features by |max| after standardization:")
+    for i, idx in enumerate(top.indices.tolist()):
+        print(f"  {morph_cols[idx]:30s} |max|={top.values[i].item():.2e}")
 
     return c_train, y_train, c_val, y_val, y_mean, y_std, morph_cols
 
@@ -435,8 +450,12 @@ def evaluate(
 
     y_mean = y_mean.cpu()
     y_std = y_std.cpu()
-    y_real = (y_real_norm * y_std + y_mean).numpy()
-    y_gen = (y_gen_norm * y_std + y_mean).numpy()
+
+    # Inverse z-score, then inverse signed log1p → original CellProfiler scale
+    y_real_log = y_real_norm * y_std + y_mean
+    y_gen_log = y_gen_norm * y_std + y_mean
+    y_real = (torch.sign(y_real_log) * torch.expm1(torch.abs(y_real_log))).numpy()
+    y_gen = (torch.sign(y_gen_log) * torch.expm1(torch.abs(y_gen_log))).numpy()
 
     _print_marginal_stats(y_real, y_gen, morph_cols)
     _plot_marginals(y_real, y_gen, morph_cols, os.path.join(cfg.output_dir, "marginals.png"))
