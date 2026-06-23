@@ -36,7 +36,7 @@ from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalF
 
 @dataclass
 class Config:
-    data_path: str = "data/whole_dataset.h5ad"
+    data_path: str = "data/whole_dataset_train_val.h5ad"
     output_dir: str = "outputs"
 
     # Architecture
@@ -55,6 +55,8 @@ class Config:
     warmup_steps: int = 1000
     ema_decay: float = 0.9999
     sigma: float = 0.0
+    leiden_key: str = "leiden"
+    val_fraction: float = 0.1
 
     # Logging / validation
     log_every: int = 100
@@ -62,6 +64,7 @@ class Config:
 
     # Eval
     n_eval_samples: int = 4096
+    n_eval_samples_per_cluster: int = 2048
     ode_rtol: float = 1e-5
     ode_atol: float = 1e-5
 
@@ -175,6 +178,44 @@ def get_morphology_columns(obs_columns: list[str]) -> list[str]:
     return cols
 
 
+def split_train_val_by_leiden_clusters(
+    leiden: np.ndarray,
+    val_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
+
+    labels, counts = np.unique(leiden.astype(str), return_counts=True)
+    rng = np.random.default_rng(seed)
+    tie_break = rng.permutation(len(labels))
+    order = np.lexsort((tie_break, -counts))
+
+    n = len(leiden)
+    target_sizes = {
+        "train": n * (1.0 - val_fraction),
+        "val": n * val_fraction,
+    }
+    split_sizes = {"train": 0, "val": 0}
+    split_clusters: dict[str, list[str]] = {"train": [], "val": []}
+
+    for i in order:
+        label = str(labels[i])
+        count = int(counts[i])
+        split = max(
+            split_sizes,
+            key=lambda name: target_sizes[name] - split_sizes[name],
+        )
+        split_clusters[split].append(label)
+        split_sizes[split] += count
+
+    leiden_str = leiden.astype(str)
+    train_idx = np.flatnonzero(np.isin(leiden_str, split_clusters["train"]))
+    val_idx = np.flatnonzero(np.isin(leiden_str, split_clusters["val"]))
+
+    return train_idx, val_idx, split_clusters
+
+
 def load_data(cfg: Config):
     print(f"Loading {cfg.data_path} ...")
     adata = anndata.read_h5ad(cfg.data_path)
@@ -185,6 +226,9 @@ def load_data(cfg: Config):
     morph_cols = get_morphology_columns(list(adata.obs.columns))
     y = torch.tensor(adata.obs[morph_cols].values.astype(np.float32), dtype=torch.float32)
     assert y.shape[1] == cfg.y_dim, f"Expected y.shape[1] == {cfg.y_dim}, got {y.shape[1]}"
+    if cfg.leiden_key not in adata.obs:
+        raise KeyError(f"Missing Leiden column {cfg.leiden_key!r} in adata.obs")
+    leiden = adata.obs[cfg.leiden_key].astype(str).to_numpy()
 
     print(f"Loaded: c={tuple(c.shape)}, y={tuple(y.shape)}")
 
@@ -209,14 +253,22 @@ def load_data(cfg: Config):
         f"any NaN={torch.isnan(y).any().item()}, any inf={torch.isinf(y).any().item()}"
     )
 
-    torch.manual_seed(cfg.seed)
-    n = len(c)
-    n_val = int(n * 0.1)
-    perm = torch.randperm(n)
-    train_idx, val_idx = perm[n_val:], perm[:n_val]
+    train_idx, val_idx, split_clusters = split_train_val_by_leiden_clusters(
+        leiden=leiden,
+        val_fraction=cfg.val_fraction,
+        seed=cfg.seed,
+    )
+    print("Leiden cluster split:")
+    for name, idx in (("train", train_idx), ("val", val_idx)):
+        clusters = split_clusters[name]
+        print(
+            f"  {name:5s}: {len(idx):7,d} cells | "
+            f"{len(clusters):2d} clusters | {', '.join(clusters)}"
+        )
 
     c_train, c_val = c[train_idx], c[val_idx]
     y_train, y_val = y[train_idx], y[val_idx]
+    leiden_train, leiden_val = leiden[train_idx], leiden[val_idx]
 
     y_mean = y_train.mean(dim=0)
     y_std = y_train.std(dim=0).clamp(min=1e-8)
@@ -230,7 +282,11 @@ def load_data(cfg: Config):
     for i, idx in enumerate(top.indices.tolist()):
         print(f"  {morph_cols[idx]:30s} |max|={top.values[i].item():.2e}")
 
-    return c_train, y_train, c_val, y_val, y_mean, y_std, morph_cols
+    return (
+        c_train, y_train, leiden_train,
+        c_val, y_val, leiden_val,
+        y_mean, y_std, morph_cols, split_clusters,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +313,18 @@ def train(cfg: Config) -> None:
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
 
-    c_train, y_train, c_val, y_val, y_mean, y_std, morph_cols = load_data(cfg)
+    (
+        c_train, y_train, _leiden_train,
+        c_val, y_val, leiden_val,
+        y_mean, y_std,
+        morph_cols, split_clusters,
+    ) = load_data(cfg)
     torch.save(
         {"mean": y_mean, "std": y_std, "columns": morph_cols},
         os.path.join(cfg.output_dir, "y_stats.pt"),
     )
+    with open(os.path.join(cfg.output_dir, "split_clusters.json"), "w") as f:
+        json.dump(split_clusters, f, indent=2)
 
     num_workers = 2 if device.type == "cuda" else 0
     pin = device.type == "cuda"
@@ -383,7 +446,7 @@ def train(cfg: Config) -> None:
     _plot_loss_curves(train_losses, train_steps, val_losses, val_steps,
                       os.path.join(cfg.output_dir, "loss_curves.png"))
 
-    evaluate(ema_model, c_val, y_val, y_mean, y_std, morph_cols, cfg, device)
+    evaluate(ema_model, c_val, y_val, leiden_val, y_mean, y_std, morph_cols, cfg, device)
 
 
 @torch.no_grad()
@@ -418,6 +481,7 @@ def evaluate(
     model: nn.Module,
     c_val: torch.Tensor,
     y_val: torch.Tensor,
+    leiden_val: np.ndarray,
     y_mean: torch.Tensor,
     y_std: torch.Tensor,
     morph_cols: list[str],
@@ -425,10 +489,89 @@ def evaluate(
     device: torch.device,
 ) -> None:
     model.eval()
+    rng = np.random.default_rng(cfg.seed)
+    unique_clusters = np.unique(leiden_val.astype(str))
+    print(f"Validation evaluation over Leiden clusters: {', '.join(unique_clusters)}")
 
-    n = min(cfg.n_eval_samples, len(c_val))
-    c_eval = c_val[:n].to(device)
-    y_real_norm = y_val[:n]
+    y_real_parts = []
+    y_gen_parts = []
+    cluster_rows = []
+
+    for cluster in unique_clusters:
+        cluster_idx = np.flatnonzero(leiden_val.astype(str) == cluster)
+        n = min(cfg.n_eval_samples_per_cluster, len(cluster_idx))
+        if n == 0:
+            continue
+        chosen_idx = rng.choice(cluster_idx, size=n, replace=False)
+        y_real, y_gen = _sample_morphology(
+            model=model,
+            c_eval=c_val[chosen_idx],
+            y_real_norm=y_val[chosen_idx],
+            y_mean=y_mean,
+            y_std=y_std,
+            cfg=cfg,
+            device=device,
+        )
+        mean_w1 = _mean_w1(y_real, y_gen)
+        cluster_rows.append((cluster, len(cluster_idx), n, mean_w1))
+        y_real_parts.append(y_real)
+        y_gen_parts.append(y_gen)
+        print(
+            f"  leiden {cluster:>4s}: evaluated {n:5,d}/{len(cluster_idx):5,d} cells | "
+            f"mean W1={mean_w1:.4f}"
+        )
+
+    y_real_all = np.concatenate(y_real_parts, axis=0)
+    y_gen_all = np.concatenate(y_gen_parts, axis=0)
+
+    metrics_path = os.path.join(cfg.output_dir, "validation_cluster_metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(
+            {
+                "split": "validation",
+                "clusters": [
+                    {
+                        "leiden": cluster,
+                        "n_available": int(n_available),
+                        "n_evaluated": int(n_evaluated),
+                        "mean_w1": float(mean_w1),
+                    }
+                    for cluster, n_available, n_evaluated, mean_w1 in cluster_rows
+                ],
+                "mean_w1": float(_mean_w1(y_real_all, y_gen_all)),
+            },
+            f,
+            indent=2,
+        )
+    print(f"Saved validation cluster metrics to {metrics_path}")
+
+    _print_marginal_stats(y_real_all, y_gen_all, morph_cols)
+    _plot_marginals(
+        y_real_all,
+        y_gen_all,
+        morph_cols,
+        os.path.join(cfg.output_dir, "validation_marginals.png"),
+    )
+    _plot_correlations(
+        y_real_all,
+        y_gen_all,
+        os.path.join(cfg.output_dir, "validation_correlations.png"),
+    )
+    print(f"Validation eval plots saved to {cfg.output_dir}/")
+
+
+@torch.no_grad()
+def _sample_morphology(
+    model: nn.Module,
+    c_eval: torch.Tensor,
+    y_real_norm: torch.Tensor,
+    y_mean: torch.Tensor,
+    y_std: torch.Tensor,
+    cfg: Config,
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    n = len(c_eval)
+    c_eval = c_eval.to(device)
 
     print(f"Sampling {n} cells with dopri5 ODE solver ...")
     y0 = torch.randn(n, cfg.y_dim, device=device)
@@ -457,10 +600,14 @@ def evaluate(
     y_real = (torch.sign(y_real_log) * torch.expm1(torch.abs(y_real_log))).numpy()
     y_gen = (torch.sign(y_gen_log) * torch.expm1(torch.abs(y_gen_log))).numpy()
 
-    _print_marginal_stats(y_real, y_gen, morph_cols)
-    _plot_marginals(y_real, y_gen, morph_cols, os.path.join(cfg.output_dir, "marginals.png"))
-    _plot_correlations(y_real, y_gen, os.path.join(cfg.output_dir, "correlations.png"))
-    print(f"Eval plots saved to {cfg.output_dir}/")
+    return y_real, y_gen
+
+
+def _mean_w1(y_real: np.ndarray, y_gen: np.ndarray) -> float:
+    return float(np.mean([
+        wasserstein_distance(y_real[:, i], y_gen[:, i])
+        for i in range(y_real.shape[1])
+    ]))
 
 
 def _print_marginal_stats(
