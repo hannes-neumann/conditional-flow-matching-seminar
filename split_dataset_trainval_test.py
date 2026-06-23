@@ -66,7 +66,9 @@ def main() -> None:
         )
     )
     parser.add_argument("--input", default="data/whole_dataset.h5ad")
-    parser.add_argument("--train-val-output", default="data/whole_dataset_train_val.h5ad")
+    parser.add_argument(
+        "--train-val-output", default="data/whole_dataset_train_val.h5ad"
+    )
     parser.add_argument("--test-output", default="data/whole_dataset_test.h5ad")
     parser.add_argument("--metadata-output", default="data/whole_dataset_split.json")
     parser.add_argument("--leiden-key", default="leiden")
