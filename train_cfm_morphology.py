@@ -188,6 +188,18 @@ def load_data(cfg: Config):
 
     print(f"Loaded: c={tuple(c.shape)}, y={tuple(y.shape)}")
 
+    # Impute NaN morphological features with per-feature median
+    nan_mask = torch.isnan(y)
+    if nan_mask.any():
+        n_nan_cells = nan_mask.any(dim=1).sum().item()
+        n_nan_vals  = nan_mask.sum().item()
+        print(f"Imputing {n_nan_vals} NaN values across {n_nan_cells} cells ({n_nan_cells/len(y)*100:.1f}%) with per-feature median")
+        for j in range(y.shape[1]):
+            col = y[:, j]
+            median = col[~torch.isnan(col)].median()
+            y[:, j] = torch.where(torch.isnan(col), median, col)
+    assert not torch.isnan(y).any() and not torch.isnan(c).any(), "NaN values remain after imputation"
+
     torch.manual_seed(cfg.seed)
     n = len(c)
     n_val = int(n * 0.1)
