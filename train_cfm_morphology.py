@@ -25,11 +25,17 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchdiffeq
 from scipy.stats import wasserstein_distance
 from torch.utils.data import DataLoader, TensorDataset
 
 from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalFlowMatcher
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 # ---------------------------------------------------------------------------
@@ -39,11 +45,14 @@ from torchcfm.conditional_flow_matching import ExactOptimalTransportConditionalF
 @dataclass
 class Config:
     data_path: str = "data/whole_dataset_train_val.h5ad"
-    output_dir: str = "outputs"
+    output_dir: str | None = None
+    model_variant: str = "pca_concat"
 
     # Architecture
     y_dim: int = 56
     c_dim: int = 50
+    x_dim: int | None = None
+    gene_encoder_hidden_dim: int = 512
     hidden_dim: int = 512
     n_res_blocks: int = 4
     time_emb_dim: int = 128
@@ -63,6 +72,12 @@ class Config:
     # Logging / validation
     log_every: int = 100
     val_every: int = 1000
+    use_wandb: bool = True
+    wandb_project: str = "cfm-morphology"
+    wandb_group: str | None = None
+    wandb_name: str | None = None
+    wandb_mode: str = "online"
+    wandb_artifact_name: str = ""
 
     # Eval
     n_eval_samples: int = 4096
@@ -91,7 +106,7 @@ def sinusoidal_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
-class ResBlock(nn.Module):
+class ConcatResBlock(nn.Module):
     def __init__(self, dim: int) -> None:
         super().__init__()
         self.net = nn.Sequential(
@@ -105,7 +120,24 @@ class ResBlock(nn.Module):
         return x + self.net(x)
 
 
-class MorphologyVectorField(nn.Module):
+class FiLMResBlock(nn.Module):
+    def __init__(self, dim: int, cond_dim: int) -> None:
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.linear1 = nn.Linear(dim, dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.linear2 = nn.Linear(dim, dim)
+        self.film = nn.Linear(cond_dim, 2 * dim)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma, beta = self.film(cond).chunk(2, dim=-1)
+        h = self.linear1(F.silu(self.norm1(x)))
+        h = (1 + gamma) * h + beta
+        h = self.linear2(F.silu(self.norm2(h)))
+        return x + h
+
+
+class PCAConcatVectorField(nn.Module):
     """v_θ(y_t, t, c): R^56 × [0,1] × R^50 → R^56"""
 
     def __init__(
@@ -127,7 +159,9 @@ class MorphologyVectorField(nn.Module):
         )
 
         self.input_proj = nn.Linear(y_dim + time_emb_dim + c_dim, hidden_dim)
-        self.res_blocks = nn.ModuleList([ResBlock(hidden_dim) for _ in range(n_res_blocks)])
+        self.res_blocks = nn.ModuleList(
+            [ConcatResBlock(hidden_dim) for _ in range(n_res_blocks)]
+        )
         self.output_head = nn.Linear(hidden_dim, y_dim)
 
     def forward(self, y_t: torch.Tensor, t: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -138,6 +172,115 @@ class MorphologyVectorField(nn.Module):
         for block in self.res_blocks:
             x = block(x)
         return self.output_head(x)
+
+
+class PCAFiLMVectorField(nn.Module):
+    def __init__(
+        self,
+        y_dim: int,
+        c_dim: int,
+        hidden_dim: int,
+        n_res_blocks: int,
+        time_emb_dim: int,
+    ) -> None:
+        super().__init__()
+        self.time_emb_dim = time_emb_dim
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim),
+        )
+
+        cond_dim = c_dim + time_emb_dim
+        self.input_proj = nn.Linear(y_dim, hidden_dim)
+        self.res_blocks = nn.ModuleList(
+            [FiLMResBlock(hidden_dim, cond_dim) for _ in range(n_res_blocks)]
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_head = nn.Linear(hidden_dim, y_dim)
+
+    def forward(self, y_t: torch.Tensor, t: torch.Tensor, x_pca: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_mlp(sinusoidal_embedding(t, self.time_emb_dim))
+        cond = torch.cat([x_pca, t_emb], dim=-1)
+
+        h = self.input_proj(y_t)
+        for block in self.res_blocks:
+            h = block(h, cond)
+        return self.output_head(self.output_norm(h))
+
+
+class FullFiLMVectorField(nn.Module):
+    def __init__(
+        self,
+        y_dim: int,
+        x_dim: int,
+        c_dim: int,
+        gene_encoder_hidden_dim: int,
+        hidden_dim: int,
+        n_res_blocks: int,
+        time_emb_dim: int,
+    ) -> None:
+        super().__init__()
+        self.time_emb_dim = time_emb_dim
+        self.gene_encoder = nn.Sequential(
+            nn.Linear(x_dim, gene_encoder_hidden_dim),
+            nn.LayerNorm(gene_encoder_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(gene_encoder_hidden_dim, c_dim),
+        )
+        self.time_mlp = nn.Sequential(
+            nn.Linear(time_emb_dim, time_emb_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim),
+        )
+
+        cond_dim = c_dim + time_emb_dim
+        self.input_proj = nn.Linear(y_dim, hidden_dim)
+        self.res_blocks = nn.ModuleList(
+            [FiLMResBlock(hidden_dim, cond_dim) for _ in range(n_res_blocks)]
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_head = nn.Linear(hidden_dim, y_dim)
+
+    def forward(self, y_t: torch.Tensor, t: torch.Tensor, x_gene: torch.Tensor) -> torch.Tensor:
+        c = self.gene_encoder(x_gene)
+        t_emb = self.time_mlp(sinusoidal_embedding(t, self.time_emb_dim))
+        cond = torch.cat([c, t_emb], dim=-1)
+
+        h = self.input_proj(y_t)
+        for block in self.res_blocks:
+            h = block(h, cond)
+        return self.output_head(self.output_norm(h))
+
+
+def build_model(cfg: Config, input_dim: int) -> nn.Module:
+    if cfg.model_variant == "pca_concat":
+        return PCAConcatVectorField(
+            y_dim=cfg.y_dim,
+            c_dim=input_dim,
+            hidden_dim=cfg.hidden_dim,
+            n_res_blocks=cfg.n_res_blocks,
+            time_emb_dim=cfg.time_emb_dim,
+        )
+    if cfg.model_variant == "pca_film":
+        return PCAFiLMVectorField(
+            y_dim=cfg.y_dim,
+            c_dim=input_dim,
+            hidden_dim=cfg.hidden_dim,
+            n_res_blocks=cfg.n_res_blocks,
+            time_emb_dim=cfg.time_emb_dim,
+        )
+    if cfg.model_variant == "full_film":
+        return FullFiLMVectorField(
+            y_dim=cfg.y_dim,
+            x_dim=input_dim,
+            c_dim=cfg.c_dim,
+            gene_encoder_hidden_dim=cfg.gene_encoder_hidden_dim,
+            hidden_dim=cfg.hidden_dim,
+            n_res_blocks=cfg.n_res_blocks,
+            time_emb_dim=cfg.time_emb_dim,
+        )
+    raise ValueError(f"Unknown model_variant {cfg.model_variant!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -257,10 +400,22 @@ def load_data(cfg: Config):
     print(f"Loading {cfg.data_path} ...")
     adata = anndata.read_h5ad(cfg.data_path)
 
-    c = torch.tensor(np.array(adata.obsm["X_pca"]), dtype=torch.float32)
-    assert c.shape[1] == cfg.c_dim, f"Expected c.shape[1] == {cfg.c_dim}, got {c.shape[1]}"
-    if not torch.isfinite(c).all():
-        raise ValueError("X_pca contains NaN or infinite values")
+    if cfg.model_variant in {"pca_concat", "pca_film"}:
+        x = torch.tensor(np.array(adata.obsm["X_pca"]), dtype=torch.float32)
+        assert x.shape[1] == cfg.c_dim, (
+            f"Expected X_pca.shape[1] == {cfg.c_dim}, got {x.shape[1]}"
+        )
+        input_name = "X_pca"
+    elif cfg.model_variant == "full_film":
+        x_np = adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)
+        x = torch.tensor(np.asarray(x_np), dtype=torch.float32)
+        cfg.x_dim = int(x.shape[1])
+        input_name = "adata.X"
+    else:
+        raise ValueError(f"Unknown model_variant {cfg.model_variant!r}")
+
+    if not torch.isfinite(x).all():
+        raise ValueError(f"{input_name} contains NaN or infinite values")
 
     morph_cols = get_morphology_columns(list(adata.obs.columns), cfg.y_dim)
     y = torch.tensor(adata.obs[morph_cols].values.astype(np.float32), dtype=torch.float32)
@@ -269,7 +424,7 @@ def load_data(cfg: Config):
         raise KeyError(f"Missing Leiden column {cfg.leiden_key!r} in adata.obs")
     leiden = adata.obs[cfg.leiden_key].astype(str).to_numpy()
 
-    print(f"Loaded: c={tuple(c.shape)}, y={tuple(y.shape)}")
+    print(f"Loaded: x={tuple(x.shape)} from {input_name}, y={tuple(y.shape)}")
 
     y = impute_nonfinite_features(y, morph_cols)
     assert torch.isfinite(y).all(), "Non-finite values remain after imputation"
@@ -297,7 +452,7 @@ def load_data(cfg: Config):
             f"{len(clusters):2d} clusters | {', '.join(clusters)}"
         )
 
-    c_train, c_val = c[train_idx], c[val_idx]
+    x_train, x_val = x[train_idx], x[val_idx]
     y_train, y_val = y[train_idx], y[val_idx]
     leiden_train, leiden_val = leiden[train_idx], leiden[val_idx]
 
@@ -316,8 +471,8 @@ def load_data(cfg: Config):
         print(f"  {morph_cols[idx]:30s} |max|={top.values[i].item():.2e}")
 
     return (
-        c_train, y_train, leiden_train,
-        c_val, y_val, leiden_val,
+        x_train, y_train, leiden_train,
+        x_val, y_val, leiden_val,
         y_mean, y_std, morph_cols, split_clusters,
     )
 
@@ -362,14 +517,97 @@ def synchronize_device(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
-def train(cfg: Config) -> None:
-    os.makedirs(cfg.output_dir, exist_ok=True)
+def init_wandb(cfg: Config, device: torch.device, parameter_count: int):
+    if not cfg.use_wandb:
+        return None
+    if wandb is None:
+        print("wandb is not installed; continuing without W&B logging.")
+        return None
 
-    with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
-        json.dump(asdict(cfg), f, indent=2)
+    run = wandb.init(
+        project=cfg.wandb_project,
+        group=cfg.wandb_group or f"cfm_h{cfg.hidden_dim}_r{cfg.n_res_blocks}",
+        name=cfg.wandb_name,
+        mode=cfg.wandb_mode,
+        dir=cfg.output_dir,
+        config={
+            **asdict(cfg),
+            "resolved_device": str(device),
+            "parameter_count": parameter_count,
+        },
+        resume="allow",
+    )
+    if getattr(run, "url", None):
+        print(f"W&B run: {run.url}")
+    else:
+        print(f"W&B run initialized in {cfg.wandb_mode!r} mode.")
+    return run
+
+
+def wandb_log(run, values: dict[str, object], step: int | None = None) -> None:
+    if run is not None:
+        run.log(values, step=step)
+
+
+def wandb_image(path: str):
+    if wandb is None:
+        return None
+    return wandb.Image(path)
+
+
+def log_output_artifact(run, cfg: Config) -> None:
+    if run is None or wandb is None:
+        return
+
+    artifact_name = cfg.wandb_artifact_name
+    artifact = wandb.Artifact(
+        name=artifact_name,
+        type="model",
+        metadata=asdict(cfg),
+    )
+    for filename in [
+        "model_ema.pt",
+        "config.json",
+        "y_stats.pt",
+        "split_clusters.json",
+        "loss_curves.png",
+        "validation_cluster_metrics.json",
+        "validation_marginals.png",
+        "validation_correlations.png",
+    ]:
+        path = os.path.join(cfg.output_dir, filename)
+        if os.path.exists(path):
+            artifact.add_file(path)
+
+    run.log_artifact(artifact)
+    print(f"Logged W&B artifact: {artifact_name}")
+
+
+def resolve_config(cfg: Config) -> Config:
+    valid_variants = {"pca_concat", "pca_film", "full_film"}
+    if cfg.model_variant not in valid_variants:
+        raise ValueError(
+            f"Unknown model_variant {cfg.model_variant!r}; "
+            f"choose one of {sorted(valid_variants)}"
+        )
+
+    if cfg.output_dir is None:
+        cfg.output_dir = os.path.join("outputs", "morphology", cfg.model_variant)
+    if cfg.wandb_group is None:
+        cfg.wandb_group = cfg.model_variant
+    if not cfg.wandb_artifact_name:
+        artifact_variant = cfg.model_variant.replace("_", "-")
+        cfg.wandb_artifact_name = f"morphology-{artifact_variant}-model"
+    return cfg
+
+
+def train(cfg: Config) -> None:
+    cfg = resolve_config(cfg)
+    os.makedirs(cfg.output_dir, exist_ok=True)
 
     device = get_device(cfg.device)
     print(f"Device: {device}")
+    print(f"Model variant: {cfg.model_variant}")
 
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -380,6 +618,10 @@ def train(cfg: Config) -> None:
         y_mean, y_std,
         morph_cols, split_clusters,
     ) = load_data(cfg)
+    input_dim = int(c_train.shape[1])
+
+    with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
+        json.dump(asdict(cfg), f, indent=2)
     torch.save(
         {"mean": y_mean, "std": y_std, "columns": morph_cols},
         os.path.join(cfg.output_dir, "y_stats.pt"),
@@ -400,14 +642,10 @@ def train(cfg: Config) -> None:
         drop_last=False, num_workers=num_workers, pin_memory=pin,
     )
 
-    model = MorphologyVectorField(
-        y_dim=cfg.y_dim,
-        c_dim=cfg.c_dim,
-        hidden_dim=cfg.hidden_dim,
-        n_res_blocks=cfg.n_res_blocks,
-        time_emb_dim=cfg.time_emb_dim,
-    ).to(device)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    model = build_model(cfg, input_dim=input_dim).to(device)
+    parameter_count = sum(p.numel() for p in model.parameters())
+    print(f"Parameters: {parameter_count:,}")
+    run = init_wandb(cfg, device, parameter_count)
 
     ema = EMA(model, decay=cfg.ema_decay)
     FM = ExactOptimalTransportConditionalFlowMatcher(sigma=cfg.sigma)
@@ -498,6 +736,17 @@ def train(cfg: Config) -> None:
                 f" | {ms_per_step:.1f}ms/step"
                 f" | {samples_per_second:,.0f} samples/s"
             )
+            wandb_log(
+                run,
+                {
+                    "train/loss": avg_loss,
+                    "train/lr": lr_now,
+                    "train/ms_per_step": ms_per_step,
+                    "train/samples_per_second": samples_per_second,
+                    "train/skipped_nonfinite_batches": skipped_nonfinite,
+                },
+                step=step,
+            )
             train_losses.append(avg_loss)
             train_steps.append(step)
             running_loss = 0.0
@@ -509,28 +758,30 @@ def train(cfg: Config) -> None:
             val_losses.append(val_loss)
             val_steps.append(step)
             print(f"  val loss={val_loss:.5f}")
+            wandb_log(run, {"val/loss": val_loss}, step=step)
             model.train()
 
     # Save EMA weights
-    ema_model = MorphologyVectorField(
-        y_dim=cfg.y_dim,
-        c_dim=cfg.c_dim,
-        hidden_dim=cfg.hidden_dim,
-        n_res_blocks=cfg.n_res_blocks,
-        time_emb_dim=cfg.time_emb_dim,
-    ).to(device)
+    ema_model = build_model(cfg, input_dim=input_dim).to(device)
     ema.apply_to(ema_model)
     ema_path = os.path.join(cfg.output_dir, "model_ema.pt")
     torch.save(ema_model.state_dict(), ema_path)
     print(f"Saved EMA model → {ema_path}")
 
-    _plot_loss_curves(train_losses, train_steps, val_losses, val_steps,
-                      os.path.join(cfg.output_dir, "loss_curves.png"))
+    loss_curves_path = os.path.join(cfg.output_dir, "loss_curves.png")
+    _plot_loss_curves(train_losses, train_steps, val_losses, val_steps, loss_curves_path)
+    if run is not None:
+        wandb_log(run, {"charts/loss_curves": wandb_image(loss_curves_path)}, step=step)
 
     if cfg.skip_eval:
         print("Skipping final ODE evaluation because --skip_eval is set.")
     else:
-        evaluate(ema_model, c_val, y_val, leiden_val, y_mean, y_std, morph_cols, cfg, device)
+        evaluate(ema_model, c_val, y_val, leiden_val, y_mean, y_std, morph_cols, cfg, device, run)
+
+    log_output_artifact(run, cfg)
+
+    if run is not None:
+        run.finish()
 
 
 @torch.no_grad()
@@ -571,6 +822,7 @@ def evaluate(
     morph_cols: list[str],
     cfg: Config,
     device: torch.device,
+    run=None,
 ) -> None:
     model.eval()
     rng = np.random.default_rng(cfg.seed)
@@ -608,6 +860,7 @@ def evaluate(
     y_real_all = np.concatenate(y_real_parts, axis=0)
     y_gen_all = np.concatenate(y_gen_parts, axis=0)
 
+    validation_mean_w1 = float(_mean_w1(y_real_all, y_gen_all))
     metrics_path = os.path.join(cfg.output_dir, "validation_cluster_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(
@@ -622,25 +875,45 @@ def evaluate(
                     }
                     for cluster, n_available, n_evaluated, mean_w1 in cluster_rows
                 ],
-                "mean_w1": float(_mean_w1(y_real_all, y_gen_all)),
+                "mean_w1": validation_mean_w1,
             },
             f,
             indent=2,
         )
     print(f"Saved validation cluster metrics to {metrics_path}")
+    wandb_log(
+        run,
+        {
+            "validation/mean_w1": validation_mean_w1,
+            **{
+                f"validation/cluster_mean_w1/{cluster}": float(mean_w1)
+                for cluster, _, _, mean_w1 in cluster_rows
+            },
+        },
+    )
 
     _print_marginal_stats(y_real_all, y_gen_all, morph_cols)
+    marginals_path = os.path.join(cfg.output_dir, "validation_marginals.png")
     _plot_marginals(
         y_real_all,
         y_gen_all,
         morph_cols,
-        os.path.join(cfg.output_dir, "validation_marginals.png"),
+        marginals_path,
     )
+    correlations_path = os.path.join(cfg.output_dir, "validation_correlations.png")
     _plot_correlations(
         y_real_all,
         y_gen_all,
-        os.path.join(cfg.output_dir, "validation_correlations.png"),
+        correlations_path,
     )
+    if run is not None:
+        wandb_log(
+            run,
+            {
+                "charts/validation_marginals": wandb_image(marginals_path),
+                "charts/validation_correlations": wandb_image(correlations_path),
+            },
+        )
     print(f"Validation eval plots saved to {cfg.output_dir}/")
 
 
@@ -787,36 +1060,59 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train CFM morphology model")
     parser.add_argument("--data_path", type=str)
     parser.add_argument("--output_dir", type=str)
+    parser.add_argument(
+        "--model_variant",
+        type=str,
+        choices=["pca_concat", "pca_film", "full_film"],
+    )
     parser.add_argument("--n_steps", type=int)
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--hidden_dim", type=int)
+    parser.add_argument("--c_dim", type=int)
+    parser.add_argument("--gene_encoder_hidden_dim", type=int)
     parser.add_argument("--n_res_blocks", type=int)
     parser.add_argument("--log_every", type=int)
     parser.add_argument("--val_every", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", type=str, choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--skip_eval", action="store_true")
+    parser.add_argument("--no_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str)
+    parser.add_argument("--wandb_group", type=str)
+    parser.add_argument("--wandb_name", type=str)
+    parser.add_argument("--wandb_mode", type=str, choices=["online", "offline", "disabled"])
+    parser.add_argument("--wandb_artifact_name", type=str)
     args = parser.parse_args()
 
     cfg = Config()
     for key in [
         "data_path",
         "output_dir",
+        "model_variant",
         "n_steps",
         "batch_size",
         "lr",
         "hidden_dim",
+        "c_dim",
+        "gene_encoder_hidden_dim",
         "n_res_blocks",
         "log_every",
         "val_every",
         "seed",
         "device",
+        "wandb_project",
+        "wandb_group",
+        "wandb_name",
+        "wandb_mode",
+        "wandb_artifact_name",
     ]:
         val = getattr(args, key)
         if val is not None:
             setattr(cfg, key, val)
     if args.skip_eval:
         cfg.skip_eval = True
+    if args.no_wandb:
+        cfg.use_wandb = False
 
     train(cfg)
