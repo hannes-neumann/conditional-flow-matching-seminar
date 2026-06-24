@@ -16,6 +16,8 @@ import os
 import time
 from dataclasses import dataclass, asdict
 
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 import anndata
 import matplotlib
 matplotlib.use("Agg")
@@ -67,6 +69,9 @@ class Config:
     n_eval_samples_per_cluster: int = 2048
     ode_rtol: float = 1e-5
     ode_atol: float = 1e-5
+    skip_eval: bool = False
+    device: str = "auto"
+    max_nonfinite_batches: int = 20
 
 
 # ---------------------------------------------------------------------------
@@ -164,54 +169,86 @@ _DROP_COLUMNS = {
     "BoundingBoxMinimum_X", "BoundingBoxMaximum_X",
     "BoundingBoxMinimum_Y", "BoundingBoxMaximum_Y",
     "Orientation",
+    "NormalizedMoment_1_0", "NormalizedMoment_0_0", "NormalizedMoment_0_1"
 }
 
 
-def get_morphology_columns(obs_columns: list[str]) -> list[str]:
+
+def get_morphology_columns(obs_columns: list[str], y_dim: int) -> list[str]:
     cols = [c for c in obs_columns if c[0].isupper()]
     cols = [c for c in cols if c not in _DROP_COLUMNS]
     cols = [c for c in cols if not c.startswith("SpatialMoment_")]
-    assert len(cols) == 56, (
-        f"Expected 56 morphological features, got {len(cols)}.\n"
+    assert len(cols) == y_dim, (
+        f"Expected {y_dim} morphological features, got {len(cols)}.\n"
         f"Columns: {cols}"
     )
     return cols
 
 
-def split_train_val_by_leiden_clusters(
+def impute_nonfinite_features(y: torch.Tensor, cols: list[str]) -> torch.Tensor:
+    finite_mask = torch.isfinite(y)
+    if finite_mask.all():
+        return y
+
+    n_bad_cells = (~finite_mask).any(dim=1).sum().item()
+    n_bad_vals = (~finite_mask).sum().item()
+    print(
+        f"Imputing {n_bad_vals} non-finite morphology values across "
+        f"{n_bad_cells} cells ({n_bad_cells / len(y) * 100:.1f}%) with per-feature median"
+    )
+
+    y = y.clone()
+    for j, col_name in enumerate(cols):
+        col = y[:, j]
+        valid = torch.isfinite(col)
+        if valid.all():
+            continue
+        if not valid.any():
+            raise ValueError(f"Morphology feature {col_name!r} has no finite values")
+        median = col[valid].median()
+        y[:, j] = torch.where(valid, col, median)
+    return y
+
+
+def split_train_val_stratified_by_leiden(
     leiden: np.ndarray,
     val_fraction: float,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray, dict[str, list[str]]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
     if not 0.0 < val_fraction < 1.0:
         raise ValueError(f"val_fraction must be in (0, 1), got {val_fraction}")
 
     labels, counts = np.unique(leiden.astype(str), return_counts=True)
     rng = np.random.default_rng(seed)
-    tie_break = rng.permutation(len(labels))
-    order = np.lexsort((tie_break, -counts))
-
-    n = len(leiden)
-    target_sizes = {
-        "train": n * (1.0 - val_fraction),
-        "val": n * val_fraction,
-    }
-    split_sizes = {"train": 0, "val": 0}
-    split_clusters: dict[str, list[str]] = {"train": [], "val": []}
-
-    for i in order:
-        label = str(labels[i])
-        count = int(counts[i])
-        split = max(
-            split_sizes,
-            key=lambda name: target_sizes[name] - split_sizes[name],
-        )
-        split_clusters[split].append(label)
-        split_sizes[split] += count
-
     leiden_str = leiden.astype(str)
-    train_idx = np.flatnonzero(np.isin(leiden_str, split_clusters["train"]))
-    val_idx = np.flatnonzero(np.isin(leiden_str, split_clusters["val"]))
+    train_parts = []
+    val_parts = []
+    per_cluster = {}
+
+    for label, count in zip(labels, counts):
+        cluster_idx = np.flatnonzero(leiden_str == str(label))
+        shuffled = rng.permutation(cluster_idx)
+        n_val = int(round(len(cluster_idx) * val_fraction))
+        if len(cluster_idx) > 1:
+            n_val = min(max(n_val, 1), len(cluster_idx) - 1)
+        val_cluster_idx = shuffled[:n_val]
+        train_cluster_idx = shuffled[n_val:]
+        train_parts.append(train_cluster_idx)
+        val_parts.append(val_cluster_idx)
+        per_cluster[str(label)] = {
+            "train": int(len(train_cluster_idx)),
+            "val": int(len(val_cluster_idx)),
+        }
+
+    train_idx = np.concatenate(train_parts)
+    val_idx = np.concatenate(val_parts)
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    split_clusters: dict[str, list[str] | dict[str, dict[str, int]]] = {
+        "train": [str(label) for label in labels],
+        "val": [str(label) for label in labels],
+        "per_cluster": per_cluster,
+    }
 
     return train_idx, val_idx, split_clusters
 
@@ -222,8 +259,10 @@ def load_data(cfg: Config):
 
     c = torch.tensor(np.array(adata.obsm["X_pca"]), dtype=torch.float32)
     assert c.shape[1] == cfg.c_dim, f"Expected c.shape[1] == {cfg.c_dim}, got {c.shape[1]}"
+    if not torch.isfinite(c).all():
+        raise ValueError("X_pca contains NaN or infinite values")
 
-    morph_cols = get_morphology_columns(list(adata.obs.columns))
+    morph_cols = get_morphology_columns(list(adata.obs.columns), cfg.y_dim)
     y = torch.tensor(adata.obs[morph_cols].values.astype(np.float32), dtype=torch.float32)
     assert y.shape[1] == cfg.y_dim, f"Expected y.shape[1] == {cfg.y_dim}, got {y.shape[1]}"
     if cfg.leiden_key not in adata.obs:
@@ -232,17 +271,8 @@ def load_data(cfg: Config):
 
     print(f"Loaded: c={tuple(c.shape)}, y={tuple(y.shape)}")
 
-    # Impute NaN morphological features with per-feature median
-    nan_mask = torch.isnan(y)
-    if nan_mask.any():
-        n_nan_cells = nan_mask.any(dim=1).sum().item()
-        n_nan_vals  = nan_mask.sum().item()
-        print(f"Imputing {n_nan_vals} NaN values across {n_nan_cells} cells ({n_nan_cells/len(y)*100:.1f}%) with per-feature median")
-        for j in range(y.shape[1]):
-            col = y[:, j]
-            median = col[~torch.isnan(col)].median()
-            y[:, j] = torch.where(torch.isnan(col), median, col)
-    assert not torch.isnan(y).any() and not torch.isnan(c).any(), "NaN values remain after imputation"
+    y = impute_nonfinite_features(y, morph_cols)
+    assert torch.isfinite(y).all(), "Non-finite values remain after imputation"
 
     # Raw CellProfiler features span many orders of magnitude and include negative values
     # (Hu moments, central moments). Signed log1p compresses the dynamic range while
@@ -252,13 +282,14 @@ def load_data(cfg: Config):
         f"After signed log1p: min={y.min().item():.3f}, max={y.max().item():.3f}, "
         f"any NaN={torch.isnan(y).any().item()}, any inf={torch.isinf(y).any().item()}"
     )
+    assert torch.isfinite(y).all(), "Signed log1p produced non-finite morphology values"
 
-    train_idx, val_idx, split_clusters = split_train_val_by_leiden_clusters(
+    train_idx, val_idx, split_clusters = split_train_val_stratified_by_leiden(
         leiden=leiden,
         val_fraction=cfg.val_fraction,
         seed=cfg.seed,
     )
-    print("Leiden cluster split:")
+    print("Stratified Leiden train/val split:")
     for name, idx in (("train", train_idx), ("val", val_idx)):
         clusters = split_clusters[name]
         print(
@@ -275,6 +306,8 @@ def load_data(cfg: Config):
 
     y_train = (y_train - y_mean) / y_std
     y_val = (y_val - y_mean) / y_std
+    assert torch.isfinite(y_train).all(), "Non-finite values in standardized y_train"
+    assert torch.isfinite(y_val).all(), "Non-finite values in standardized y_val"
 
     abs_max = y_train.abs().max(dim=0).values
     top = torch.topk(abs_max, k=5)
@@ -301,13 +334,41 @@ def _make_lr_lambda(warmup_steps: int):
     return lr_lambda
 
 
+def get_device(requested: str) -> torch.device:
+    requested = requested.lower()
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            print("MPS is available; using CPU by default. Pass --device mps to try Apple GPU.")
+        return torch.device("cpu")
+    if requested == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested --device cuda, but CUDA is not available")
+        return torch.device("cuda")
+    if requested == "mps":
+        if not torch.backends.mps.is_available():
+            raise RuntimeError("Requested --device mps, but MPS is not available")
+        return torch.device("mps")
+    if requested == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unknown device {requested!r}; use auto, cuda, mps, or cpu")
+
+
+def synchronize_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
+
+
 def train(cfg: Config) -> None:
     os.makedirs(cfg.output_dir, exist_ok=True)
 
     with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
         json.dump(asdict(cfg), f, indent=2)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device(cfg.device)
     print(f"Device: {device}")
 
     torch.manual_seed(cfg.seed)
@@ -359,7 +420,7 @@ def train(cfg: Config) -> None:
     )
 
     use_amp = device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     amp_ctx = (
         torch.autocast(device_type="cuda", dtype=torch.float16)
         if use_amp
@@ -373,6 +434,7 @@ def train(cfg: Config) -> None:
 
     running_loss = 0.0
     running_count = 0
+    skipped_nonfinite = 0
     step = 0
     t0 = time.time()
     data_iter = iter(train_loader)
@@ -395,6 +457,21 @@ def train(cfg: Config) -> None:
             pred = model(yt, t, c_b)
             loss = nn.functional.mse_loss(pred, ut)
 
+        if not torch.isfinite(loss).item():
+            skipped_nonfinite += 1
+            print(
+                f"Skipping non-finite loss batch "
+                f"({skipped_nonfinite}/{cfg.max_nonfinite_batches}); "
+                f"loss={loss.item()}"
+            )
+            optimizer.zero_grad(set_to_none=True)
+            if skipped_nonfinite >= cfg.max_nonfinite_batches:
+                raise RuntimeError(
+                    "Too many non-finite training batches. Try --device cpu, "
+                    "a smaller learning rate, or inspect morphology outliers."
+                )
+            continue
+
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -408,14 +485,18 @@ def train(cfg: Config) -> None:
         step += 1
 
         if step % cfg.log_every == 0:
+            synchronize_device(device)
+            elapsed = time.time() - t0
             avg_loss = running_loss / running_count
             lr_now = scheduler.get_last_lr()[0]
-            ms_per_step = (time.time() - t0) / cfg.log_every * 1000
+            ms_per_step = elapsed / running_count * 1000
+            samples_per_second = cfg.batch_size * running_count / elapsed
             print(
                 f"step {step:6d}/{cfg.n_steps}"
                 f" | loss={avg_loss:.5f}"
                 f" | lr={lr_now:.2e}"
                 f" | {ms_per_step:.1f}ms/step"
+                f" | {samples_per_second:,.0f} samples/s"
             )
             train_losses.append(avg_loss)
             train_steps.append(step)
@@ -446,7 +527,10 @@ def train(cfg: Config) -> None:
     _plot_loss_curves(train_losses, train_steps, val_losses, val_steps,
                       os.path.join(cfg.output_dir, "loss_curves.png"))
 
-    evaluate(ema_model, c_val, y_val, leiden_val, y_mean, y_std, morph_cols, cfg, device)
+    if cfg.skip_eval:
+        print("Skipping final ODE evaluation because --skip_eval is set.")
+    else:
+        evaluate(ema_model, c_val, y_val, leiden_val, y_mean, y_std, morph_cols, cfg, device)
 
 
 @torch.no_grad()
@@ -707,13 +791,32 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--hidden_dim", type=int)
+    parser.add_argument("--n_res_blocks", type=int)
+    parser.add_argument("--log_every", type=int)
+    parser.add_argument("--val_every", type=int)
     parser.add_argument("--seed", type=int)
+    parser.add_argument("--device", type=str, choices=["auto", "cuda", "mps", "cpu"])
+    parser.add_argument("--skip_eval", action="store_true")
     args = parser.parse_args()
 
     cfg = Config()
-    for key in ["data_path", "output_dir", "n_steps", "batch_size", "lr", "hidden_dim", "seed"]:
+    for key in [
+        "data_path",
+        "output_dir",
+        "n_steps",
+        "batch_size",
+        "lr",
+        "hidden_dim",
+        "n_res_blocks",
+        "log_every",
+        "val_every",
+        "seed",
+        "device",
+    ]:
         val = getattr(args, key)
         if val is not None:
             setattr(cfg, key, val)
+    if args.skip_eval:
+        cfg.skip_eval = True
 
     train(cfg)
