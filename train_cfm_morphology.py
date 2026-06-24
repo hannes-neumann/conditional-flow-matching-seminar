@@ -45,13 +45,13 @@ class Config:
     y_dim: int = 56
     c_dim: int = 50
     hidden_dim: int = 512
-    n_res_blocks: int = 6
+    n_res_blocks: int = 4
     time_emb_dim: int = 128
 
     # Training
     seed: int = 42
-    batch_size: int = 1024
-    n_steps: int = 50_000
+    batch_size: int = 512
+    n_steps: int = 30_000
     lr: float = 2e-4
     weight_decay: float = 1e-4
     warmup_steps: int = 1000
