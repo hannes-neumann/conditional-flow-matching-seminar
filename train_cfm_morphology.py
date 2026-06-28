@@ -46,7 +46,7 @@ except ImportError:
 class Config:
     data_path: str = "data/whole_dataset_train_val.h5ad"
     output_dir: str | None = None
-    model_variant: str = "pca_concat"
+    model_variant: str = "pca_film"
 
     # Architecture
     y_dim: int = 56
@@ -54,7 +54,7 @@ class Config:
     x_dim: int | None = None
     gene_encoder_hidden_dim: int = 512
     hidden_dim: int = 512
-    n_res_blocks: int = 4
+    n_res_blocks: int = 6
     time_emb_dim: int = 128
 
     # Training
@@ -72,6 +72,7 @@ class Config:
     # Logging / validation
     log_every: int = 100
     val_every: int = 1000
+    artifact_checkpoint_step: int = 30_000
     use_wandb: bool = True
     wandb_project: str = "cfm-morphology"
     wandb_group: str | None = None
@@ -401,11 +402,16 @@ def load_data(cfg: Config):
     adata = anndata.read_h5ad(cfg.data_path)
 
     if cfg.model_variant in {"pca_concat", "pca_film"}:
-        x = torch.tensor(np.array(adata.obsm["X_pca"]), dtype=torch.float32)
+        x_pca = torch.tensor(np.array(adata.obsm["X_pca"]), dtype=torch.float32)
+        if x_pca.shape[1] < cfg.c_dim:
+            raise ValueError(
+                f"Requested top {cfg.c_dim} PCs, but X_pca only has {x_pca.shape[1]}"
+            )
+        x = x_pca[:, : cfg.c_dim]
         assert x.shape[1] == cfg.c_dim, (
-            f"Expected X_pca.shape[1] == {cfg.c_dim}, got {x.shape[1]}"
+            f"Expected sliced X_pca.shape[1] == {cfg.c_dim}, got {x.shape[1]}"
         )
-        input_name = "X_pca"
+        input_name = f"X_pca[:, :{cfg.c_dim}]"
     elif cfg.model_variant == "full_film":
         x_np = adata.X.toarray() if hasattr(adata.X, "toarray") else np.asarray(adata.X)
         x = torch.tensor(np.asarray(x_np), dtype=torch.float32)
@@ -555,6 +561,33 @@ def wandb_image(path: str):
     return wandb.Image(path)
 
 
+def _slugify(value: str) -> str:
+    keep = []
+    for char in value.strip():
+        if char.isalnum() or char in {"-", "_"}:
+            keep.append(char)
+        elif char in {" ", ".", "/"}:
+            keep.append("-")
+    slug = "".join(keep).strip("-_")
+    return slug or "run"
+
+
+def make_run_output_dir(cfg: Config, run) -> str:
+    base_output_dir = cfg.output_dir
+    if cfg.wandb_name:
+        run_tag = _slugify(cfg.wandb_name)
+    elif run is not None and getattr(run, "name", None):
+        run_tag = _slugify(str(run.name))
+    else:
+        run_tag = time.strftime("%Y%m%d-%H%M%S")
+
+    # Add run.id when available so manually reused W&B names do not overwrite each other.
+    if run is not None and getattr(run, "id", None):
+        run_tag = f"{run_tag}-{_slugify(str(run.id))}"
+
+    return os.path.join(base_output_dir, run_tag)
+
+
 def log_output_artifact(run, cfg: Config) -> None:
     if run is None or wandb is None:
         return
@@ -581,6 +614,46 @@ def log_output_artifact(run, cfg: Config) -> None:
 
     run.log_artifact(artifact)
     print(f"Logged W&B artifact: {artifact_name}")
+
+
+def save_step_artifact_checkpoint(
+    *,
+    run,
+    cfg: Config,
+    ema: EMA,
+    input_dim: int,
+    device: torch.device,
+    step: int,
+) -> None:
+    checkpoint_dir = os.path.join(cfg.output_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    ema_model = build_model(cfg, input_dim=input_dim).to(device)
+    ema.apply_to(ema_model)
+    checkpoint_path = os.path.join(checkpoint_dir, f"model_ema_step_{step}.pt")
+    torch.save(ema_model.state_dict(), checkpoint_path)
+    print(f"Saved EMA step checkpoint → {checkpoint_path}")
+
+    if run is None or wandb is None:
+        return
+
+    artifact_name = cfg.wandb_artifact_name
+    artifact = wandb.Artifact(
+        name=artifact_name,
+        type="model",
+        metadata={**asdict(cfg), "checkpoint_step": step},
+    )
+    artifact.add_file(checkpoint_path, name=f"model_ema_step_{step}.pt")
+    for filename in ["config.json", "y_stats.pt", "split_clusters.json"]:
+        path = os.path.join(cfg.output_dir, filename)
+        if os.path.exists(path):
+            artifact.add_file(path)
+
+    run.log_artifact(
+        artifact,
+        aliases=[f"step-{step}", f"{cfg.model_variant}-step-{step}"],
+    )
+    print(f"Logged W&B artifact checkpoint at step {step}: {artifact_name}")
 
 
 def resolve_config(cfg: Config) -> Config:
@@ -620,15 +693,6 @@ def train(cfg: Config) -> None:
     ) = load_data(cfg)
     input_dim = int(c_train.shape[1])
 
-    with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
-        json.dump(asdict(cfg), f, indent=2)
-    torch.save(
-        {"mean": y_mean, "std": y_std, "columns": morph_cols},
-        os.path.join(cfg.output_dir, "y_stats.pt"),
-    )
-    with open(os.path.join(cfg.output_dir, "split_clusters.json"), "w") as f:
-        json.dump(split_clusters, f, indent=2)
-
     num_workers = 2 if device.type == "cuda" else 0
     pin = device.type == "cuda"
     train_loader = DataLoader(
@@ -646,6 +710,20 @@ def train(cfg: Config) -> None:
     parameter_count = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {parameter_count:,}")
     run = init_wandb(cfg, device, parameter_count)
+    cfg.output_dir = make_run_output_dir(cfg, run)
+    os.makedirs(cfg.output_dir, exist_ok=True)
+    print(f"Run output dir: {cfg.output_dir}")
+    if run is not None:
+        run.config.update({"output_dir": cfg.output_dir}, allow_val_change=True)
+
+    with open(os.path.join(cfg.output_dir, "config.json"), "w") as f:
+        json.dump(asdict(cfg), f, indent=2)
+    torch.save(
+        {"mean": y_mean, "std": y_std, "columns": morph_cols},
+        os.path.join(cfg.output_dir, "y_stats.pt"),
+    )
+    with open(os.path.join(cfg.output_dir, "split_clusters.json"), "w") as f:
+        json.dump(split_clusters, f, indent=2)
 
     ema = EMA(model, decay=cfg.ema_decay)
     FM = ExactOptimalTransportConditionalFlowMatcher(sigma=cfg.sigma)
@@ -673,6 +751,7 @@ def train(cfg: Config) -> None:
     running_loss = 0.0
     running_count = 0
     skipped_nonfinite = 0
+    logged_artifact_checkpoint = False
     step = 0
     t0 = time.time()
     data_iter = iter(train_loader)
@@ -721,6 +800,21 @@ def train(cfg: Config) -> None:
         running_loss += loss.item()
         running_count += 1
         step += 1
+
+        if (
+            not logged_artifact_checkpoint
+            and cfg.artifact_checkpoint_step > 0
+            and step >= cfg.artifact_checkpoint_step
+        ):
+            save_step_artifact_checkpoint(
+                run=run,
+                cfg=cfg,
+                ema=ema,
+                input_dim=input_dim,
+                device=device,
+                step=step,
+            )
+            logged_artifact_checkpoint = True
 
         if step % cfg.log_every == 0:
             synchronize_device(device)
@@ -849,18 +943,20 @@ def evaluate(
             device=device,
         )
         mean_w1 = _mean_w1(y_real, y_gen)
-        cluster_rows.append((cluster, len(cluster_idx), n, mean_w1))
+        mean_normalized_w1 = _mean_normalized_w1(y_real, y_gen)
+        cluster_rows.append((cluster, len(cluster_idx), n, mean_w1, mean_normalized_w1))
         y_real_parts.append(y_real)
         y_gen_parts.append(y_gen)
         print(
             f"  leiden {cluster:>4s}: evaluated {n:5,d}/{len(cluster_idx):5,d} cells | "
-            f"mean W1={mean_w1:.4f}"
+            f"mean W1={mean_w1:.4f} | normalized W1={mean_normalized_w1:.4f}"
         )
 
     y_real_all = np.concatenate(y_real_parts, axis=0)
     y_gen_all = np.concatenate(y_gen_parts, axis=0)
 
     validation_mean_w1 = float(_mean_w1(y_real_all, y_gen_all))
+    validation_mean_normalized_w1 = float(_mean_normalized_w1(y_real_all, y_gen_all))
     metrics_path = os.path.join(cfg.output_dir, "validation_cluster_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(
@@ -872,22 +968,33 @@ def evaluate(
                         "n_available": int(n_available),
                         "n_evaluated": int(n_evaluated),
                         "mean_w1": float(mean_w1),
+                        "mean_normalized_w1": float(mean_normalized_w1),
                     }
-                    for cluster, n_available, n_evaluated, mean_w1 in cluster_rows
+                    for cluster, n_available, n_evaluated, mean_w1, mean_normalized_w1 in cluster_rows
                 ],
                 "mean_w1": validation_mean_w1,
+                "mean_normalized_w1": validation_mean_normalized_w1,
             },
             f,
             indent=2,
         )
+    print(
+        f"Validation combined: mean W1={validation_mean_w1:.4f}, "
+        f"normalized W1={validation_mean_normalized_w1:.4f}"
+    )
     print(f"Saved validation cluster metrics to {metrics_path}")
     wandb_log(
         run,
         {
             "validation/mean_w1": validation_mean_w1,
+            "validation/mean_normalized_w1": validation_mean_normalized_w1,
             **{
                 f"validation/cluster_mean_w1/{cluster}": float(mean_w1)
-                for cluster, _, _, mean_w1 in cluster_rows
+                for cluster, _, _, mean_w1, _ in cluster_rows
+            },
+            **{
+                f"validation/cluster_mean_normalized_w1/{cluster}": float(mean_normalized_w1)
+                for cluster, _, _, _, mean_normalized_w1 in cluster_rows
             },
         },
     )
@@ -961,26 +1068,46 @@ def _sample_morphology(
 
 
 def _mean_w1(y_real: np.ndarray, y_gen: np.ndarray) -> float:
-    return float(np.mean([
+    return float(_w1_metrics(y_real, y_gen)["w1"].mean())
+
+
+def _mean_normalized_w1(y_real: np.ndarray, y_gen: np.ndarray) -> float:
+    return float(_w1_metrics(y_real, y_gen)["normalized_w1"].mean())
+
+
+def _w1_metrics(y_real: np.ndarray, y_gen: np.ndarray, eps: float = 1e-8) -> dict[str, np.ndarray]:
+    w1 = np.array([
         wasserstein_distance(y_real[:, i], y_gen[:, i])
         for i in range(y_real.shape[1])
-    ]))
+    ])
+    real_std = y_real.std(axis=0)
+    normalized_w1 = w1 / np.maximum(real_std, eps)
+    return {"w1": w1, "real_std": real_std, "normalized_w1": normalized_w1}
 
 
 def _print_marginal_stats(
     y_real: np.ndarray, y_gen: np.ndarray, cols: list[str]
 ) -> None:
-    w1_list = []
-    header = f"{'Feature':<42} {'real_mean':>10} {'gen_mean':>10} {'real_std':>10} {'gen_std':>10} {'W1':>10}"
+    metrics = _w1_metrics(y_real, y_gen)
+    w1_list = metrics["w1"]
+    normalized_w1_list = metrics["normalized_w1"]
+    header = (
+        f"{'Feature':<42} {'real_mean':>10} {'gen_mean':>10} "
+        f"{'real_std':>10} {'gen_std':>10} {'W1':>10} {'norm_W1':>10}"
+    )
     print("\n" + header)
     print("-" * len(header))
     for i, col in enumerate(cols):
         rm, gm = y_real[:, i].mean(), y_gen[:, i].mean()
         rs, gs = y_real[:, i].std(), y_gen[:, i].std()
-        w1 = wasserstein_distance(y_real[:, i], y_gen[:, i])
-        w1_list.append(w1)
-        print(f"{col:<42} {rm:>10.4f} {gm:>10.4f} {rs:>10.4f} {gs:>10.4f} {w1:>10.4f}")
+        w1 = w1_list[i]
+        normalized_w1 = normalized_w1_list[i]
+        print(
+            f"{col:<42} {rm:>10.4f} {gm:>10.4f} {rs:>10.4f} "
+            f"{gs:>10.4f} {w1:>10.4f} {normalized_w1:>10.4f}"
+        )
     print(f"\nMean W1 distance: {np.mean(w1_list):.4f}")
+    print(f"Mean normalized W1 distance: {np.mean(normalized_w1_list):.4f}")
 
 
 def _plot_marginals(
@@ -1074,6 +1201,7 @@ if __name__ == "__main__":
     parser.add_argument("--n_res_blocks", type=int)
     parser.add_argument("--log_every", type=int)
     parser.add_argument("--val_every", type=int)
+    parser.add_argument("--artifact_checkpoint_step", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device", type=str, choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--skip_eval", action="store_true")
@@ -1099,6 +1227,7 @@ if __name__ == "__main__":
         "n_res_blocks",
         "log_every",
         "val_every",
+        "artifact_checkpoint_step",
         "seed",
         "device",
         "wandb_project",
