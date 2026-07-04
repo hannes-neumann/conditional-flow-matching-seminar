@@ -15,6 +15,7 @@ models/
 notebooks/models/
 outputs/morphology
 outputs/validation_model_comparison/artifacts
+outputs/
 
 # macOS
 .DS_Store

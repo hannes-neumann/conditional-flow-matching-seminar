@@ -50,7 +50,7 @@ class Config:
 
     # Architecture
     y_dim: int = 56
-    c_dim: int = 50
+    c_dim: int = 30
     x_dim: int | None = None
     gene_encoder_hidden_dim: int = 512
     hidden_dim: int = 512
