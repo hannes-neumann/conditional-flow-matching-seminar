@@ -56,32 +56,33 @@ except ImportError:
 
 
 DEFAULT_MODEL_SPECS: list[dict[str, Any]] = [
-    {
-        "name": "unconditioned",
-        "model_variant": "baseline",
-        "checkpoint_path": "models/morphology/dark-feather-17.pt",
-        "y_stats_path": "outputs/y_stats.pt",
-        "hidden_dim": 512,
-        "n_res_blocks": 6,
-        "time_emb_dim": 128,
-        "y_dim": 56,
-    },
-    {
-        "name": "50pc_film_model",
-        "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-pca-film-model:v0",
-    },
-    {
-        "name": "50pc_concat_model",
-        "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-pca-concat-model:v0",
-    },
-    {
-        "name": "full_film_model",
-        "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-full-film-model:v0",
-    },
-    {
-        "name": "30pc_film",
-        "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-pca-film-model:v3",
-    },
+    # {
+    #     "name": "unconditioned",
+    #     "model_variant": "baseline",
+    #     "checkpoint_path": "models/morphology/dark-feather-17.pt",
+    #     "y_stats_path": "outputs/y_stats.pt",
+    #     "hidden_dim": 512,
+    #     "n_res_blocks": 6,
+    #     "time_emb_dim": 128,
+    #     "y_dim": 56,
+    # },
+    # {
+    #     "name": "50pc_film_model",
+    #     "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-pca-film-model:v0",
+    # },
+    # {
+    #     "name": "50pc_concat_model",
+    #     "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-pca-concat-model:v0",
+    # },
+    # {
+    #     "name": "full_film_model",
+    #     "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-full-film-model:v0",
+    # },
+    # {
+    #     "name": "30pc_film",
+    #     "artifact": "hneumann-university-of-mannheim/cfm-morphology/morphology-pca-film-model:v3",
+    # },
+    
 ]
 
 
